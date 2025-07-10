@@ -3,15 +3,19 @@ from __future__ import annotations
 import contextlib
 import warnings
 from typing import Any, Literal
+from collections.abc import Collection
+from types import NoneType
 
 import anndata as ad
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import leidenalg as la
 import scipy.sparse as sps
 from anndata import AnnData
 from numpy.typing import NDArray
-from scipy.sparse import coo_matrix, hstack, issparse, spdiags
+from igraph import Graph
+from scipy.sparse import coo_matrix, hstack, issparse, spdiags, find, sparray, spmatrix
 from scipy.spatial import distance
 from sklearn.metrics import f1_score
 from sklearn.mixture import GaussianMixture
@@ -29,7 +33,7 @@ __all__ = ["calculate_niche"]
 @inject_docs(fla=NicheDefinitions)
 def calculate_niche(
     data: AnnData | SpatialData,
-    flavor: Literal["neighborhood", "utag", "cellcharter"],
+    flavor: Literal["neighborhood", "utag", "cellcharter", "spatialleiden"],
     library_key: str | None = None,
     table_key: str | None = None,
     mask: pd.core.series.Series = None,
@@ -45,6 +49,11 @@ def calculate_niche(
     n_components: int | None = None,
     random_state: int = 42,
     spatial_connectivities_key: str = "spatial_connectivities",
+    latent_connectivities_key: str = "connectivities",
+    layer_ratio: float = 1,
+    partition_type = la.RBConfigurationVertexPartition,
+    n_iterations: int = -1,
+    use_weights: tuple[bool, bool] = (True, True),
     inplace: bool = True,
 ) -> AnnData:
     """
@@ -59,6 +68,7 @@ def calculate_niche(
             - `{fla.NEIGHBORHOOD.s!r}` - cluster the neighborhood profile.
             - `{fla.UTAG.s!r}` - use utag algorithm (matrix multiplication).
             - `{fla.CELLCHARTER.s!r}` - cluster adjacency matrix with Gaussian Mixture Model (GMM) using CellCharter's approach.
+            - `{fla.SPATIALLEIDEN.s!r}` - cluster spatially resolved omics data using Multiplex Leiden.
     %(library_key)s
         If provided, niches will be calculated separately for each unique value in this column.
         Each niche will be prefixed with the library identifier.
@@ -75,7 +85,8 @@ def calculate_niche(
         Required if flavor == `{fla.NEIGHBORHOOD.s!r}` or flavor == `{fla.UTAG.s!r}`.
     resolutions
         List of resolutions to use for leiden clustering.
-        Required if flavor == `{fla.NEIGHBORHOOD.s!r}` or flavor == `{fla.UTAG.s!r}`.
+        Required if flavor == `{fla.NEIGHBORHOOD.s!r}` or flavor == `{fla.UTAG.s!r}` or flavor == `{fla.SPATIALLEIDEN.s!r}`.
+        In the case of spatialleiden you can pass a tuple 
     min_niche_size
         Minimum required size of a niche. Niches with fewer cells will be labeled as 'not_a_niche'.
         Optional if flavor == `{fla.NEIGHBORHOOD.s!r}`.
@@ -99,10 +110,26 @@ def calculate_niche(
         Number of components to use for GMM.
         Required if flavor == `{fla.CELLCHARTER.s!r}`.
     random_state
-        Random state to use for GMM.
-        Optional if flavor == `{fla.CELLCHARTER.s!r}`.
+        Random state to use for GMM and Multiplex Leiden.
+        Optional if flavor == `{fla.CELLCHARTER.s!r}` or flavor == `{fla.SPATIALLEIDEN.s!r}`.
     spatial_connectivities_key
         Key in `adata.obsp` where spatial connectivities are stored.
+        Optional if flavor == `{fla.SPATIALLEIDEN.s!r}`.
+    latent_connectivities_key
+        Key in `adata.obsp` where latent connectivities are stored.
+        Optional if flavor == `{fla.SPATIALLEIDEN.s!r}`.
+    layer_ratio
+        The ratio of the weighting of the layers in latent and  space. A higher ratio will increase relevance of the topological neighbors and lead to more spatially homogeneous clusters.
+        Optional if flavor == `{fla.SPATIALLEIDEN.s!r}`.
+    partition_type
+        A :py:class:`leidenalg.VertexPartition.MutableVertexPartition` to be used.
+        Optional if flavor == `{fla.SPATIALLEIDEN.s!r}`.
+    n_iterations
+        Number of iterations to run the Multiplex Leiden algorithm. If the number is negative it runs until convergence.
+        Optional if flavor == `{fla.SPATIALLEIDEN.s!r}`.
+    use_weights
+        Whether to use weights for the edges for latent and topological neighbors, respectively.
+        Optional if flavor == `{fla.SPATIALLEIDEN.s!r}`.
     inplace
         If 'True', perform the operation in place.
         If 'False', return a new AnnData object with the niche labels.
@@ -127,11 +154,20 @@ def calculate_niche(
         aggregation,
         n_components,
         random_state,
+        latent_connectivities_key,
+        spatial_connectivities_key,
+        layer_ratio,
+        partition_type,
+        n_iterations,
+        use_weights,
         inplace,
     )
 
     if resolutions is None:
-        resolutions = [0.5]
+        if flavor == "spatialleiden":
+            resolutions = [(1.0, 1.0)]
+        else:
+            resolutions = [0.5]
 
     if distance is None:
         distance = 1
@@ -147,6 +183,12 @@ def calculate_niche(
         raise KeyError(
             f"Key '{spatial_connectivities_key}' not found in `adata.obsp`. "
             "If you haven't computed a spatial neighborhood graph yet, use `sq.gr.spatial_neighbors`."
+        )
+    
+    if latent_connectivities_key not in adata.obsp.keys():
+        raise KeyError(
+            f"Key '{latent_connectivities_key}' not found in `adata.obsp`. "
+            "If you haven't computed a latent neighborhood graph yet, use `sc.pp.neighbors`."
         )
 
     result_columns = _get_result_columns(
@@ -179,7 +221,7 @@ def calculate_niche(
             lib_mask = None
             if mask is not None:
                 lib_mask = mask[mask.index.isin(lib_indices)]
-
+            
             lib_result = calculate_niche(
                 lib_adata,
                 flavor=flavor,
@@ -197,6 +239,11 @@ def calculate_niche(
                 n_components=n_components,
                 random_state=random_state,
                 spatial_connectivities_key=spatial_connectivities_key,
+                latent_connectivities_key=latent_connectivities_key,
+                layer_ratio=layer_ratio,
+                partition_type=partition_type,
+                n_iterations=n_iterations,
+                use_weights=use_weights,
                 inplace=False,
             )
 
@@ -225,6 +272,11 @@ def calculate_niche(
             n_components,
             random_state,
             spatial_connectivities_key,
+            latent_connectivities_key,
+            layer_ratio,
+            partition_type,
+            n_iterations,
+            use_weights,
         )
 
     if not inplace:
@@ -264,6 +316,10 @@ def _get_result_columns(
             return [base_column]
         elif libraries is not None and len(libraries) > 0:
             return [f"{base_column}_{lib}" for lib in libraries]
+    
+    if flavor == "spatialleiden":
+        base_column = "spatialleiden"
+        return [base_column]
 
     # For neighborhood and utag, we need to handle resolutions
     if not isinstance(resolutions, list):
@@ -293,6 +349,11 @@ def _calculate_niches(
     n_components: int | None,
     random_state: int,
     spatial_connectivities_key: str,
+    latent_connectivities_key: str,
+    layer_ratio: float,
+    partition_type,
+    n_iterations: int,
+    use_weights: tuple[bool, bool],
 ) -> None:
     """Calculate niches using the specified flavor and parameters."""
     if flavor == "neighborhood":
@@ -321,6 +382,18 @@ def _calculate_niches(
             n_components,
             random_state,
             spatial_connectivities_key,
+        )
+    elif flavor == "spatialleiden":   
+        _get_spatialleiden_niches(
+            adata,
+            spatial_connectivities_key,
+            latent_connectivities_key,
+            resolutions,
+            partition_type,
+            layer_ratio,
+            use_weights,
+            n_iterations,
+            random_state,
         )
 
 
@@ -627,6 +700,122 @@ def _get_GMM_clusters(A: NDArray[np.float64], n_components: int, random_state: i
 
     return labels
 
+def _get_spatialleiden_niches(
+    adata,
+    spatial_connectivities_key,
+    latent_connectivities_key,
+    resolutions,
+    partition_type,
+    layer_ratio,
+    use_weights,
+    n_iterations,
+    random_state,
+) -> None:
+    
+    import __editable___spatialleiden_0_1_0_finder
+
+    spati
+
+    """adapted from https://github.com/HiDiHlabs/SpatialLeiden/blob/main/spatialleiden/_multiplex_leiden.py"""
+    if partition_type is None:
+        partition_type = la.RBConfigurationVertexPartition
+    
+    if latent_connectivities_key is None:
+        raise ValueError("`latent_connectivities_key` is required for spatialleiden clustering")
+    else:
+        latent_distances = adata.obsp[latent_connectivities_key]
+    if spatial_connectivities_key is None:
+        raise ValueError("`spatial_connectivities_key` is required for spatialleiden clustering")
+    else:
+        spatial_distances = adata.obsp[spatial_connectivities_key]
+
+    latent_partition_kwargs = dict()
+    spatial_partition_kwargs = dict()
+    
+    latent_partition_kwargs["resolution_parameter"] = resolutions[0]
+    spatial_partition_kwargs["resolution_parameter"] = resolutions[1]
+
+    cluster = _multiplex_leiden(
+        latent_distances,
+        spatial_distances,
+        # directed=directed,
+        use_weights=use_weights,
+        n_iterations=n_iterations,
+        partition_type=partition_type,
+        layer_weights=[1, layer_ratio],
+        partition_kwargs=[latent_partition_kwargs, spatial_partition_kwargs],
+        random_state=random_state,
+    )
+
+    adata.obs["spatialleiden"] = cluster
+    adata.obs["spatialleiden"] = adata.obs["spatialleiden"].astype("category")
+    return
+
+
+
+def _multiplex_leiden(
+    *neighbors: sparray | spmatrix | np.ndarray,
+    # directed: bool | Collection[bool] = True,
+    use_weights: bool | Collection[bool] = True,
+    n_iterations: int = -1,
+    partition_type=la.RBConfigurationVertexPartition,
+    layer_weights: float | Collection[float] = 1,
+    partition_kwargs: dict | None | Collection[dict | None] = None,
+    random_state: int = 42,
+) -> NDArray[np.integer]:
+    def _check_length(x, type, n) -> Collection | list:
+        if isinstance(x, type):
+            x = [x] * n
+        elif len(x) != n:
+            raise ValueError("")
+        return x
+
+    n_layers = len(neighbors)
+
+    # directed = _check_length([False, False], bool, n_layers)
+    directed = [False, False]
+    use_weights = _check_length(use_weights, bool, n_layers)
+    layer_weights = _check_length(layer_weights, float, n_layers)
+    partition_kwargs = _check_length(partition_kwargs, (dict, NoneType), n_layers)
+
+    layers = [
+        _build_igraph(n, directed=d) for n, d in zip(neighbors, directed, strict=True)
+    ]
+
+    # parameterise the partitions
+    partition_kwargs_ls = list()
+    for p_kwargs, with_weight in zip(partition_kwargs, use_weights, strict=True):
+        p_kwargs = p_kwargs if p_kwargs is not None else dict()
+        if with_weight:
+            p_kwargs["weights"] = "weight"
+        partition_kwargs_ls.append(p_kwargs)
+
+    partitions = [
+        partition_type(layer, **kwargs)
+        for layer, kwargs in zip(layers, partition_kwargs_ls, strict=True)
+    ]
+
+    optimiser = la.Optimiser()
+    optimiser.set_rng_seed(random_state)
+
+    _ = optimiser.optimise_partition_multiplex(
+        partitions,
+        layer_weights=list(layer_weights),
+        n_iterations=n_iterations,
+    )
+
+    return np.array(partitions[0].membership)
+
+def _build_igraph(adjacency: sparray | spmatrix | np.ndarray, *, directed: bool = True) -> Graph:
+    sources, targets, weights = find(adjacency)
+    g = Graph(
+        n=adjacency.shape[0],
+        edges=zip(sources, targets),
+        directed=directed,
+        edge_attrs={"weight": weights},
+    )
+    return g
+
 
 def _fide_score(adata: AnnData, niche_key: str, average: bool) -> Any:
     """
@@ -667,7 +856,7 @@ def _jensen_shannon_divergence(adata: AnnData, niche_key: str, library_key: str)
 
 def _validate_niche_args(
     data: AnnData | SpatialData,
-    flavor: Literal["neighborhood", "utag", "cellcharter"],
+    flavor: Literal["neighborhood", "utag", "cellcharter", "spatialleiden"],
     library_key: str | None,
     table_key: str | None,
     groups: str | None,
@@ -681,6 +870,12 @@ def _validate_niche_args(
     aggregation: str | None,
     n_components: int | None,
     random_state: int,
+    latent_connectivities_key: str,
+    spatial_connectivities_key: str,
+    layer_ratio: float,
+    partition_type,
+    n_iterations: int,
+    use_weights: tuple[bool, bool],
     inplace: bool,
 ) -> None:
     """
@@ -697,8 +892,8 @@ def _validate_niche_args(
     if not isinstance(data, AnnData | SpatialData):
         raise TypeError(f"'data' must be an AnnData or SpatialData object, got {type(data).__name__}")
 
-    if flavor not in ["neighborhood", "utag", "cellcharter"]:
-        raise ValueError(f"Invalid flavor '{flavor}'. Please choose one of 'neighborhood', 'utag', 'cellcharter'.")
+    if flavor not in ["neighborhood", "utag", "cellcharter", "spatialleiden"]:
+        raise ValueError(f"Invalid flavor '{flavor}'. Please choose one of 'neighborhood', 'utag', 'cellcharter', 'spatialleiden'.")
 
     if library_key is not None:
         if not isinstance(library_key, str):
@@ -770,6 +965,25 @@ def _validate_niche_args(
                 "abs_nhood",
                 "n_neighbors",
                 "resolutions",
+                "n_hop_weights",
+            ],
+        },
+        "spatialleiden": {
+            "required": ["latent_connectivities_key", "spatial_connectivities_key"],
+            "optional": [
+                "resolutions",
+                "layer_ratio",
+                "partition_type",
+                "n_iterations",
+                "use_weights",
+                "random_state",
+            ],
+            "unused": [
+                "groups",
+                "min_niche_size",
+                "scale",
+                "abs_nhood",
+                "n_neighbors",
                 "n_hop_weights",
             ],
         },
